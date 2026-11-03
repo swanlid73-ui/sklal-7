@@ -6,13 +6,16 @@ import { useI18n } from '@/i18n'
 import { formatQty, formatDateTime, formatEGP } from '@/lib/format'
 import { toast, errorMessage } from '@/lib/toast'
 import { useLiveRefresh } from '@/lib/realtime'
-import { Search } from 'lucide-react'
+import { ArrowLeftRight, Search } from 'lucide-react'
 import { OwnerBadge } from '@/components/OwnerBadge'
 import { ErrorState } from '@/components/ErrorState'
 import { useCatalogName } from '@/modules/core/useCatalogName'
 import { mergeCompany, mergeOwner, type MergedStockRow, type MergedOwnerRow } from './stockRows'
 import { summarize, formatPct } from './stockMetrics'
 import { parseGuestPrice, parseCost } from './guestPrice'
+import { canAddToSelection, getIneligibleReason, type IneligibleReason, type TransferCandidate, type TransferSelection } from './transferSelection'
+import { TransferModal } from './TransferModal'
+import { SelectCheckbox, TransferActionBar } from './TransferSelectionControls'
 
 type KindFilter = 'all' | 'assets' | 'consumables'
 type StockTab = 'company' | 'owner'
@@ -251,7 +254,7 @@ export function WarehousePage() {
         </button>
       </div>
 
-      <StockView scope={tab} />
+      <StockView key={tab} scope={tab} />
     </div>
   )
 }
@@ -279,6 +282,55 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
   const [costTarget, setCostTarget] = useState<SetCostTarget | null>(null)
 
   const isOwner = scope === 'owner'
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selection, setSelection] = useState<TransferSelection>([])
+  const [transferOpen, setTransferOpen] = useState(false)
+  const transferDirection = isOwner ? 'to_company' : 'to_owner'
+  const selectedKeys = useMemo(() => new Set(selection.map((e) => e.row.key)), [selection])
+
+  const toCandidate = (row: MergedStockRow): TransferCandidate => {
+    const apartmentId = isOwner ? (row as MergedOwnerRow).apartment_id : null
+    return {
+      key: `${row.item_id}-${apartmentId ?? ''}`,
+      item_id: row.item_id,
+      name: row.name,
+      kind: row.kind,
+      qty: row.qty,
+      apartment_id: apartmentId,
+      unit: { base_unit: row.base_unit, pack_size: row.pack_size, pack_label: row.pack_label },
+    }
+  }
+
+  const toggleRow = (row: MergedStockRow) => {
+    const candidate = toCandidate(row)
+    setSelection((prev) => {
+      if (prev.some((e) => e.row.key === candidate.key)) return prev.filter((e) => e.row.key !== candidate.key)
+      return canAddToSelection(prev, candidate) ? [...prev, { row: candidate, qty: 1 }] : prev
+    })
+  }
+
+  const selectEligibleVisible = () => {
+    setSelection((prev) => {
+      let next = prev
+      for (const row of filtered) {
+        const candidate = toCandidate(row)
+        if (canAddToSelection(next, candidate)) next = [...next, { row: candidate, qty: 1 }]
+      }
+      return next
+    })
+  }
+
+  const toggleSelectionMode = () => {
+    setSelectionMode((v) => !v)
+    setSelection([])
+  }
+
+  const handleTransferDone = () => {
+    setTransferOpen(false)
+    setSelectionMode(false)
+    setSelection([])
+    loadData(true)
+  }
 
   const loadData = useCallback((silent?: boolean) => {
     const quiet = silent === true
@@ -472,6 +524,41 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
     setSearchParams(params, { replace: true })
   }
 
+  const selectedOwnerCode = useMemo(() => {
+    const apartmentId = selection[0]?.row.apartment_id
+    if (apartmentId == null) return null
+    return ownerRows.find((r) => r.apartment_id === apartmentId)?.code ?? null
+  }, [selection, ownerRows])
+
+  const selectState = (row: MergedStockRow): { checked: boolean; reason: IneligibleReason | null } => {
+    if (selectedKeys.has(toCandidate(row).key)) return { checked: true, reason: null }
+    return { checked: false, reason: getIneligibleReason(selection, toCandidate(row)) }
+  }
+
+  const reasonText = (reason: IneligibleReason) => {
+    if (reason === 'consumable') return t.admin.stock.reasonConsumable
+    if (reason === 'noStock') return t.admin.stock.reasonNoStock
+    return t.admin.stock.reasonOtherApartment
+  }
+
+  const renderSelectBox = (row: MergedStockRow) => {
+    const { checked, reason } = selectState(row)
+    return (
+      <SelectCheckbox
+        checked={checked}
+        disabled={reason !== null}
+        label={cat.itemName(row.name)}
+        title={reason ? reasonText(reason) : undefined}
+        onToggle={() => toggleRow(row)}
+      />
+    )
+  }
+
+  const renderReasonLine = (row: MergedStockRow) => {
+    const { reason } = selectState(row)
+    return reason ? <span className="block text-xs text-muted mt-0.5">{reasonText(reason)}</span> : null
+  }
+
   if (loading) {
     return <div className="px-4 pt-8 text-center text-muted">{t.app.loading}</div>
   }
@@ -540,6 +627,15 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
             </button>
           ))}
         </div>
+        <button
+          type="button"
+          onClick={toggleSelectionMode}
+          aria-pressed={selectionMode}
+          className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border transition-colors whitespace-nowrap ${selectionMode ? 'bg-accent text-white border-accent' : 'bg-surface text-muted border-line'}`}
+        >
+          <ArrowLeftRight className="w-4 h-4" />
+          {isOwner ? stock.transferToCompany : stock.transferToOwner}
+        </button>
         {!isOwner && (
           <button
             onClick={toggleBelowMin}
@@ -572,6 +668,7 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
               <table className="w-full border-collapse">
                 <thead>
                   <tr>
+                    {selectionMode && <th className="w-11 border-b border-line" />}
                     <th className="text-left font-medium text-muted text-xs px-2.5 py-2 border-b border-line">{stock.title}</th>
                     <th className="text-left font-medium text-muted text-xs px-2.5 py-2 border-b border-line whitespace-nowrap">{t.common.balance} / {stock.min}</th>
                     <th className="text-left font-medium text-muted text-xs px-2.5 py-2 border-b border-line whitespace-nowrap">{stock.avgCost}</th>
@@ -583,17 +680,19 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
                 </thead>
                 <tbody>
                   {group.items.map((item) => {
-                    const expanded = !isOwner && expandedId === item.item_id
+                    const expanded = !isOwner && !selectionMode && expandedId === item.item_id
                     const minPct = !isOwner && item.min_stock ? Math.min((item.qty / item.min_stock) * 100, 100) : 100
                     const itemRow = item as MergedStockRow
                     return (
                       <Fragment key={`${item.item_id}-${isOwner ? (item as MergedOwnerRow).apartment_id : ''}`}>
                         <tr
-                          onClick={() => !isOwner && toggleExpand(item.item_id)}
-                          className={!isOwner ? 'cursor-pointer transition-colors hover:bg-app' : ''}
+                          onClick={() => (selectionMode ? toggleRow(itemRow) : !isOwner && toggleExpand(item.item_id))}
+                          className={selectionMode || !isOwner ? 'cursor-pointer transition-colors hover:bg-app' : ''}
                         >
+                          {selectionMode && <td className="px-1 py-2.5 border-b border-line">{renderSelectBox(itemRow)}</td>}
                           <td className="px-2.5 py-2.5 border-b border-line">
                             <span className="text-sm text-ink">{cat.itemName(itemRow.name)}</span>
+                            {selectionMode && renderReasonLine(itemRow)}
                           </td>
                           <td className="px-2.5 py-2.5 border-b border-line whitespace-nowrap" style={{ minWidth: '140px' }}>
                             <span className={itemRow.below_min ? 'text-bad' : 'text-ink'}>{n(formatQty(itemRow.qty, itemRow))}</span>
@@ -687,12 +786,15 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
             <div className="md:hidden bg-surface border border-line rounded-xl divide-y divide-line">
               {group.items.map((item) => {
                 const itemRow = item as MergedStockRow
-                const expanded = !isOwner && expandedId === item.item_id
+                const expanded = !isOwner && !selectionMode && expandedId === item.item_id
                 return (
                   <div key={`${item.item_id}-${isOwner ? (item as MergedOwnerRow).apartment_id : ''}`} className="px-3 py-3">
+                    <div className="flex items-start gap-2">
+                      {selectionMode && <div className="pt-1 -ml-1">{renderSelectBox(itemRow)}</div>}
+                      <div className="flex-1 min-w-0">
                     <div
-                      onClick={() => !isOwner && toggleExpand(item.item_id)}
-                      className={!isOwner ? 'cursor-pointer' : ''}
+                      onClick={() => (selectionMode ? toggleRow(itemRow) : !isOwner && toggleExpand(item.item_id))}
+                      className={selectionMode || !isOwner ? 'cursor-pointer' : ''}
                     >
                       <div className="flex items-start justify-between gap-2 mb-2">
                         <span className="text-sm text-ink font-medium">{cat.itemName(itemRow.name)}</span>
@@ -745,6 +847,8 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
                         </div>
                       </div>
                     </div>
+                      </div>
+                    </div>
                     {expanded && (
                       <div className="mt-3 pt-3 border-t border-line">
                         <div className="text-xs font-semibold text-muted uppercase tracking-wider mb-2">{stock.history}</div>
@@ -788,6 +892,24 @@ function StockView({ scope }: { scope: 'company' | 'owner' }) {
         )}
       </div>
 
+      {selectionMode && (
+        <TransferActionBar
+          count={selection.length}
+          canContinue={selection.length > 0}
+          onSelectEligible={selectEligibleVisible}
+          onContinue={() => setTransferOpen(true)}
+          onCancel={toggleSelectionMode}
+        />
+      )}
+      {transferOpen && selection.length > 0 && (
+        <TransferModal
+          direction={transferDirection}
+          selection={selection}
+          ownerCode={selectedOwnerCode}
+          onClose={() => setTransferOpen(false)}
+          onDone={handleTransferDone}
+        />
+      )}
       {costTarget && (
         <SetCostModal
           target={costTarget}
